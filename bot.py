@@ -7,7 +7,7 @@ import sqlite3
 import threading
 import time
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from io import BytesIO
 from typing import Any
 
@@ -30,10 +30,7 @@ load_dotenv()
 def require_env(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
-        raise RuntimeError(
-            f"Environment variable '{name}' is not set. "
-            f"Add it to your .env file for local development or to Secrets on the server."
-        )
+        raise RuntimeError(f"Environment variable '{name}' is not set.")
     return value
 
 
@@ -46,10 +43,14 @@ WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram/webhook").strip() or "/teleg
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", hashlib.sha256(BOT_TOKEN.encode()).hexdigest())
 MEMORY_DB_PATH = os.getenv("MEMORY_DB_PATH", "bot_memory.sqlite3")
 
+# Free-tier daily quotas (approx): gemini-1.5-flash-8b=1500, gemini-1.5-flash=1500,
+# gemini-2.0-flash=1500, gemini-2.5-flash=50.
+# Order: highest free quota first so quota exhaustion on one model falls over to the next.
 MODEL_CANDIDATES = (
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-flash",
+    "gemini-1.5-flash-8b",
+    "gemini-1.5-flash",
     "gemini-2.0-flash",
+    "gemini-2.5-flash",
 )
 
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "90"))
@@ -82,7 +83,6 @@ SYSTEM_INSTRUCTION = (
 )
 
 WORD_RE = re.compile(r"[a-zA-Z0-9]+")
-
 STOP_WORDS = {
     "a", "an", "the", "and", "or", "but", "if", "in", "on", "at", "to", "for",
     "of", "with", "by", "from", "up", "about", "into", "through", "during",
@@ -93,7 +93,6 @@ STOP_WORDS = {
     "not", "no", "so", "as", "just", "also", "then", "than", "more", "very",
     "what", "how", "who", "when", "where", "which", "there", "here", "now",
 }
-
 CONTINUATION_PHRASES = {
     "ok", "go on", "continue", "and then", "what next", "keep going",
     "solve it", "solve them", "solve this", "explain", "elaborate",
@@ -102,18 +101,16 @@ CONTINUATION_PHRASES = {
     "make it shorter", "make it brief", "finish it", "complete it",
     "what do you think", "and", "so", "well", "right",
 }
-
 PHOTO_CONTINUATION_PHRASES = {
     "solve it", "solve them", "what is in the photo", "what does it say",
     "read it", "analyze it", "explain the task", "answer based on the photo",
     "continue solving", "what does this say", "describe it",
 }
-
 COMMON_WORD_ENDINGS = (
     "tion", "sion", "ness", "ment", "ing", "ive", "ous", "ful", "less",
     "ible", "able", "ance", "ence", "ity", "ies", "ied", "ers", "est",
-    "ily", "eed", "ed", "er", "es", "ly", "al", "ic",
-    "en", "ry", "ty", "fy", "ze", "se", "ce",
+    "ily", "eed", "ed", "er", "es", "ly", "al", "ic", "en", "ry", "ty",
+    "fy", "ze", "se", "ce",
 )
 
 
@@ -128,15 +125,8 @@ def normalize_prompt(text: str) -> str:
 
 
 def extract_keywords(text: str) -> set[str]:
-    words = {
-        match.group(0).lower()
-        for match in WORD_RE.finditer(text or "")
-    }
-    return {
-        stem_word(word)
-        for word in words
-        if len(word) >= 3 and word not in STOP_WORDS
-    }
+    words = {m.group(0).lower() for m in WORD_RE.finditer(text or "")}
+    return {stem_word(w) for w in words if len(w) >= 3 and w not in STOP_WORDS}
 
 
 def stem_word(word: str) -> str:
@@ -166,14 +156,17 @@ def recent_topic_overlap(prompt: str, recent_texts: list[str]) -> float:
     return len(shared) / max(1, len(prompt_keywords))
 
 
-def decide_prompt_routing(prompt: str, recent_texts: list[str], has_image_context: bool) -> PromptRoutingDecision:
+def decide_prompt_routing(
+    prompt: str, recent_texts: list[str], has_image_context: bool
+) -> PromptRoutingDecision:
     normalized = normalize_prompt(prompt)
     if not normalized:
         return PromptRoutingDecision(reset_context=False, use_image_context=False)
     if contains_any_phrase(normalized, CONTINUATION_PHRASES):
         return PromptRoutingDecision(
             reset_context=False,
-            use_image_context=has_image_context and contains_any_phrase(normalized, PHOTO_CONTINUATION_PHRASES),
+            use_image_context=has_image_context
+            and contains_any_phrase(normalized, PHOTO_CONTINUATION_PHRASES),
         )
     overlap = recent_topic_overlap(normalized, recent_texts)
     standalone_prompt = len(normalized) >= 20 or len(extract_keywords(normalized)) >= 3
@@ -207,14 +200,10 @@ class ImageContext:
 
 
 # ---------------------------------------------------------------------------
-# Simple per-user rate limiter — prevents spam and protects API quota
+# Per-user rate limiter — prevents spam and protects API quota
 # ---------------------------------------------------------------------------
 
 class RateLimiter:
-    """
-    Tracks the last request time per user.
-    Returns (allowed, seconds_to_wait).
-    """
     def __init__(self, min_interval: float = 3.0) -> None:
         self.min_interval = min_interval
         self._last: dict[int, float] = {}
@@ -230,7 +219,7 @@ class RateLimiter:
 
 
 # ---------------------------------------------------------------------------
-# Conversation memory (SQLite, thread-safe)
+# Conversation memory (SQLite)
 # ---------------------------------------------------------------------------
 
 class ConversationMemory:
@@ -242,74 +231,65 @@ class ConversationMemory:
         self._ensure_db()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path)
-        connection.row_factory = sqlite3.Row
-        return connection
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
 
     def _ensure_db(self) -> None:
-        with self._lock:
-            with self._connect() as connection:
-                connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS conversation_messages (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        chat_id INTEGER NOT NULL,
-                        role TEXT NOT NULL,
-                        content TEXT NOT NULL,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                    """
-                )
-                connection.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_conversation_messages_chat_id_id
-                    ON conversation_messages (chat_id, id)
-                    """
-                )
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS conversation_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )"""
+            )
+            conn.execute(
+                """CREATE INDEX IF NOT EXISTS idx_conv_chat_id
+                ON conversation_messages (chat_id, id)"""
+            )
 
-    def _clip_for_memory(self, text: str) -> str:
+    def _clip(self, text: str) -> str:
         cleaned = (text or "").strip()
         if len(cleaned) <= self.max_message_chars:
             return cleaned
-        return cleaned[: self.max_message_chars].rstrip() + "\n\n[Truncated for memory]"
+        return cleaned[: self.max_message_chars].rstrip() + "\n\n[Truncated]"
 
-    def _prune(self, connection: sqlite3.Connection, chat_id: int) -> None:
-        rows = connection.execute(
-            "SELECT id FROM conversation_messages WHERE chat_id = ? ORDER BY id DESC",
+    def _prune(self, conn: sqlite3.Connection, chat_id: int) -> None:
+        rows = conn.execute(
+            "SELECT id FROM conversation_messages WHERE chat_id=? ORDER BY id DESC",
             (chat_id,),
         ).fetchall()
-        stale_rows = rows[self.max_messages :]
-        if stale_rows:
-            connection.executemany(
-                "DELETE FROM conversation_messages WHERE id = ?",
-                [(row["id"],) for row in stale_rows],
+        stale = rows[self.max_messages :]
+        if stale:
+            conn.executemany(
+                "DELETE FROM conversation_messages WHERE id=?",
+                [(r["id"],) for r in stale],
             )
 
-    def _add_exchange_sync(self, chat_id: int, user_text: str, assistant_text: str) -> None:
-        clipped_user = self._clip_for_memory(user_text)
-        clipped_assistant = self._clip_for_memory(assistant_text)
-        with self._lock:
-            with self._connect() as connection:
-                connection.execute(
-                    "INSERT INTO conversation_messages (chat_id, role, content) VALUES (?, ?, ?)",
-                    (chat_id, "user", clipped_user),
-                )
-                connection.execute(
-                    "INSERT INTO conversation_messages (chat_id, role, content) VALUES (?, ?, ?)",
-                    (chat_id, "assistant", clipped_assistant),
-                )
-                self._prune(connection, chat_id)
+    def _add_sync(self, chat_id: int, user_text: str, assistant_text: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO conversation_messages (chat_id, role, content) VALUES (?,?,?)",
+                (chat_id, "user", self._clip(user_text)),
+            )
+            conn.execute(
+                "INSERT INTO conversation_messages (chat_id, role, content) VALUES (?,?,?)",
+                (chat_id, "assistant", self._clip(assistant_text)),
+            )
+            self._prune(conn, chat_id)
 
     async def add_exchange(self, chat_id: int, user_text: str, assistant_text: str) -> None:
-        await asyncio.to_thread(self._add_exchange_sync, chat_id, user_text, assistant_text)
+        await asyncio.to_thread(self._add_sync, chat_id, user_text, assistant_text)
 
     def _get_contents_sync(self, chat_id: int) -> list[types.Content]:
-        with self._lock:
-            with self._connect() as connection:
-                rows = connection.execute(
-                    "SELECT role, content FROM conversation_messages WHERE chat_id = ? ORDER BY id ASC",
-                    (chat_id,),
-                ).fetchall()
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT role, content FROM conversation_messages WHERE chat_id=? ORDER BY id ASC",
+                (chat_id,),
+            ).fetchall()
         contents: list[types.Content] = []
         for row in rows:
             part = types.Part(text=row["content"])
@@ -323,24 +303,22 @@ class ConversationMemory:
         return await asyncio.to_thread(self._get_contents_sync, chat_id)
 
     def _get_recent_texts_sync(self, chat_id: int, limit: int) -> list[str]:
-        with self._lock:
-            with self._connect() as connection:
-                rows = connection.execute(
-                    "SELECT content FROM conversation_messages WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
-                    (chat_id, limit),
-                ).fetchall()
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT content FROM conversation_messages WHERE chat_id=? ORDER BY id DESC LIMIT ?",
+                (chat_id, limit),
+            ).fetchall()
         return [row["content"] for row in reversed(rows)]
 
     async def get_recent_texts(self, chat_id: int, limit: int = 6) -> list[str]:
         return await asyncio.to_thread(self._get_recent_texts_sync, chat_id, limit)
 
-    def _clear_chat_sync(self, chat_id: int) -> None:
-        with self._lock:
-            with self._connect() as connection:
-                connection.execute("DELETE FROM conversation_messages WHERE chat_id = ?", (chat_id,))
+    def _clear_sync(self, chat_id: int) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM conversation_messages WHERE chat_id=?", (chat_id,))
 
     async def clear_chat(self, chat_id: int) -> None:
-        await asyncio.to_thread(self._clear_chat_sync, chat_id)
+        await asyncio.to_thread(self._clear_sync, chat_id)
 
 
 class ImageSessionStore:
@@ -350,26 +328,30 @@ class ImageSessionStore:
 
     def remember(self, chat_id: int, image_bytes: bytes, mime_type: str) -> None:
         self._items[chat_id] = ImageContext(
-            image_bytes=image_bytes,
-            mime_type=mime_type,
-            saved_at=time.time(),
+            image_bytes=image_bytes, mime_type=mime_type, saved_at=time.time()
         )
 
     def get(self, chat_id: int) -> ImageContext | None:
-        context = self._items.get(chat_id)
-        if context is None:
+        ctx = self._items.get(chat_id)
+        if ctx is None:
             return None
-        if time.time() - context.saved_at > self.ttl_seconds:
+        if time.time() - ctx.saved_at > self.ttl_seconds:
             self._items.pop(chat_id, None)
             return None
-        return context
+        return ctx
 
     def clear(self, chat_id: int) -> None:
         self._items.pop(chat_id, None)
 
 
 class RepeatingChatAction:
-    def __init__(self, bot: Bot, chat_id: int, action: ChatAction = ChatAction.TYPING, interval: float = 4.0) -> None:
+    def __init__(
+        self,
+        bot: Bot,
+        chat_id: int,
+        action: ChatAction = ChatAction.TYPING,
+        interval: float = 4.0,
+    ) -> None:
         self.bot = bot
         self.chat_id = chat_id
         self.action = action
@@ -384,35 +366,27 @@ class RepeatingChatAction:
     async def __aenter__(self) -> None:
         self._task = asyncio.create_task(self._run())
 
-    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        if self._task is None:
-            return
-        self._task.cancel()
-        with suppress(asyncio.CancelledError):
-            await self._task
+    async def __aexit__(self, *_: Any) -> None:
+        if self._task:
+            self._task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._task
 
 
 def main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                KeyboardButton(text=TEXT_MODE_BUTTON),
-                KeyboardButton(text=PHOTO_MODE_BUTTON),
-            ]
-        ],
+        keyboard=[[KeyboardButton(text=TEXT_MODE_BUTTON), KeyboardButton(text=PHOTO_MODE_BUTTON)]],
         resize_keyboard=True,
         input_field_placeholder="Choose a mode",
     )
 
 
-def split_text_for_telegram(text: str, chunk_size: int = TELEGRAM_SAFE_CHUNK_SIZE) -> list[str]:
+def split_text(text: str, chunk_size: int = TELEGRAM_SAFE_CHUNK_SIZE) -> list[str]:
     normalized = (text or "").strip()
     if not normalized:
         return ["Could not generate a response."]
-
     chunks: list[str] = []
     remaining = normalized
-
     while len(remaining) > TELEGRAM_TEXT_LIMIT:
         split_at = remaining.rfind("\n\n", 0, chunk_size)
         if split_at < chunk_size // 2:
@@ -423,28 +397,24 @@ def split_text_for_telegram(text: str, chunk_size: int = TELEGRAM_SAFE_CHUNK_SIZ
             split_at = remaining.rfind(" ", 0, chunk_size)
         if split_at <= 0:
             split_at = chunk_size
-
         chunk = remaining[:split_at].strip()
         if not chunk:
             chunk = remaining[:chunk_size]
             split_at = chunk_size
-
         chunks.append(chunk)
         remaining = remaining[split_at:].lstrip()
-
     if remaining:
         chunks.append(remaining)
-
     return chunks
 
 
 async def answer_in_chunks(message: Message, text: str) -> None:
-    for chunk in split_text_for_telegram(text):
+    for chunk in split_text(text):
         await message.answer(chunk)
 
 
 # ---------------------------------------------------------------------------
-# Gemini service — with safety detection and smart error messages
+# Gemini service — multi-model fallback with smart error detection
 # ---------------------------------------------------------------------------
 
 class GeminiService:
@@ -470,23 +440,28 @@ class GeminiService:
         prompt = (prompt or "").strip()
         if not prompt:
             return "Empty prompt. Please type something."
-
         logger.info("Text request chat_id=%s chars=%s", chat_id, len(prompt))
         contents = await self.memory.get_contents(chat_id)
         contents.append(types.UserContent(parts=[types.Part(text=prompt)]))
-
         reply = await self._generate(contents)
-        if not reply.startswith("__"):  # don't save error sentinels
+        if not reply.startswith("__"):
             await self.memory.add_exchange(chat_id, prompt, reply)
         return reply
 
-    async def ask_image(self, chat_id: int, image_bytes: bytes, prompt: str, mime_type: str = "image/jpeg") -> str:
+    async def ask_image(
+        self,
+        chat_id: int,
+        image_bytes: bytes,
+        prompt: str,
+        mime_type: str = "image/jpeg",
+    ) -> str:
         if not image_bytes:
             return "Could not read the image. Please try again."
-
         prompt = (prompt or "").strip() or "What is in this image? Describe it in detail."
-        logger.info("Photo request chat_id=%s prompt_chars=%s image_bytes=%s", chat_id, len(prompt), len(image_bytes))
-
+        logger.info(
+            "Photo request chat_id=%s prompt_chars=%s image_bytes=%s",
+            chat_id, len(prompt), len(image_bytes),
+        )
         contents = await self.memory.get_contents(chat_id)
         contents.append(
             types.UserContent(
@@ -496,7 +471,6 @@ class GeminiService:
                 ]
             )
         )
-
         reply = await self._generate(contents)
         if not reply.startswith("__"):
             await self.memory.add_exchange(chat_id, f"[Photo] {prompt}", reply)
@@ -506,13 +480,13 @@ class GeminiService:
         last_error: Exception | None = None
 
         for attempt, model_name in enumerate(self.models):
-            # Brief backoff between model retries (not before first attempt)
             if attempt > 0:
-                await asyncio.sleep(1.5 * attempt)
+                delay = 2.0 * attempt  # 2s, 4s, 6s between retries
+                logger.info("Waiting %.1fs before trying next model (%s)...", delay, model_name)
+                await asyncio.sleep(delay)
 
             try:
-                logger.info("Trying model: %s (attempt %d)", model_name, attempt + 1)
-
+                logger.info("Trying model: %s (attempt %d/%d)", model_name, attempt + 1, len(self.models))
                 response = await asyncio.wait_for(
                     asyncio.to_thread(
                         self.client.models.generate_content,
@@ -526,70 +500,61 @@ class GeminiService:
                 text = self._extract_text(response)
 
                 if text == _SAFETY_BLOCKED:
-                    logger.info("Content blocked by safety filters on model %s.", model_name)
+                    logger.info("Safety filter blocked content on model %s.", model_name)
                     return (
                         "This content could not be processed due to safety guidelines.\n\n"
                         "Please try with a different image or question."
                     )
 
                 if text == _RECITATION_BLOCKED:
-                    logger.info("Content blocked for recitation on model %s.", model_name)
+                    logger.info("Recitation block on model %s.", model_name)
                     return (
-                        "The response was blocked to avoid reproducing protected content. "
+                        "The response was blocked to avoid reproducing protected content.\n"
                         "Try rephrasing your request."
                     )
 
                 if text:
+                    logger.info("Success with model %s.", model_name)
                     return text
 
-                logger.warning("Model %s returned an empty response.", model_name)
-                # Try next model
+                logger.warning("Model %s returned empty response — trying next.", model_name)
 
             except asyncio.TimeoutError:
                 last_error = asyncio.TimeoutError("Request timed out")
                 logger.warning("Timeout on model %s.", model_name)
-                # Timeout — no point retrying same category, try next
                 continue
 
             except Exception as exc:
                 last_error = exc
-                logger.warning("Model error %s: %s", model_name, exc, exc_info=False)
-                if self._should_try_next_model(exc):
+                logger.warning("Model %s error: %s", model_name, exc, exc_info=False)
+                if self._should_try_next(exc):
                     continue
                 break
 
-        # All models failed
-        logger.error("All models exhausted. Last error: %r", last_error)
+        # All models failed — show a specific, honest message
+        logger.error("All %d models exhausted. Last error: %r", len(self.models), last_error)
         error_str = str(last_error or "").lower()
 
         if "timeout" in error_str or "deadline exceeded" in error_str:
             return (
-                "The request took too long and timed out.\n\n"
+                "The request took too long to process.\n\n"
                 "Try shortening your message or breaking it into smaller parts."
             )
 
-        if "429" in error_str or "quota" in error_str or "rate limit" in error_str or "resource exhausted" in error_str:
+        if any(k in error_str for k in ("429", "quota", "rate limit", "resource exhausted")):
             return (
-                "The AI service is temporarily busy due to high demand.\n\n"
-                "Please wait a moment and try again."
+                "The daily request limit for the AI service has been reached.\n\n"
+                "This limit resets every 24 hours. Please try again later.\n"
+                "Use /new to start a fresh conversation when you come back."
             )
 
         return (
-            "Something went wrong on our end. The AI service is temporarily unavailable.\n\n"
-            "Please try again in a few seconds. If the problem continues, use /new to start fresh."
+            "The AI service is not responding right now.\n\n"
+            "Please try again in a moment. If it keeps failing, use /new to start fresh."
         )
 
     @staticmethod
     def _extract_text(response: Any) -> str:
-        """
-        Extract text from a Gemini response.
-        Returns one of:
-          - The response text (success)
-          - _SAFETY_BLOCKED if content was blocked by safety filters
-          - _RECITATION_BLOCKED if blocked for recitation
-          - "" if the response is empty for any other reason
-        """
-        # Fast path — response.text is already concatenated
         text = getattr(response, "text", None)
         if isinstance(text, str) and text.strip():
             return text.strip()
@@ -597,7 +562,6 @@ class GeminiService:
         try:
             candidates = getattr(response, "candidates", None) or []
             if not candidates:
-                # No candidates at all — check prompt_feedback for safety block
                 feedback = getattr(response, "prompt_feedback", None)
                 if feedback:
                     block_reason = str(getattr(feedback, "block_reason", "") or "")
@@ -605,39 +569,35 @@ class GeminiService:
                         return _SAFETY_BLOCKED
 
             for candidate in candidates:
-                # Check finish_reason
                 finish_reason = getattr(candidate, "finish_reason", None)
                 finish_str = str(finish_reason or "").upper()
                 if "SAFETY" in finish_str or finish_str == "2":
                     return _SAFETY_BLOCKED
                 if "RECITATION" in finish_str or finish_str == "4":
                     return _RECITATION_BLOCKED
-
-                # Try to extract text parts
                 content = getattr(candidate, "content", None)
                 parts = getattr(content, "parts", None) or []
-                chunks: list[str] = []
-                for part in parts:
-                    part_text = getattr(part, "text", None)
-                    if isinstance(part_text, str) and part_text.strip():
-                        chunks.append(part_text.strip())
+                chunks = [
+                    p_text.strip()
+                    for part in parts
+                    if isinstance(p_text := getattr(part, "text", None), str) and p_text.strip()
+                ]
                 if chunks:
                     return "\n".join(chunks)
-
         except Exception:
             pass
-
         return ""
 
     @staticmethod
-    def _should_try_next_model(exc: Exception) -> bool:
+    def _should_try_next(exc: Exception) -> bool:
         msg = str(exc).lower()
         retryable = (
             "429", "quota", "rate limit", "resource exhausted",
             "temporarily unavailable", "service unavailable",
             "internal", "unavailable", "404", "not found", "model",
+            "permission", "billing", "invalid", "not supported",
         )
-        return any(marker in msg for marker in retryable)
+        return any(k in msg for k in retryable)
 
 
 # ---------------------------------------------------------------------------
@@ -687,24 +647,33 @@ async def configure_webhook_with_retry(attempts: int = 10, delay_seconds: int = 
             logger.info("Webhook registered: %s", webhook_url())
             return True
         except Exception as exc:
-            logger.warning("Failed to register webhook, attempt %s/%s: %s", attempt, attempts, exc)
+            logger.warning("Webhook attempt %s/%s failed: %s", attempt, attempts, exc)
             if attempt < attempts:
                 await asyncio.sleep(delay_seconds)
-    logger.error("Webhook could not be registered automatically.")
+    logger.error("Webhook could not be registered.")
     return False
 
 
 async def disable_webhook_for_polling() -> None:
     try:
         await bot.delete_webhook(drop_pending_updates=False)
-        logger.info("Webhook disabled. Bot running in polling mode.")
+        logger.info("Webhook disabled — polling mode.")
     except Exception as exc:
-        logger.warning("Could not disable webhook before polling: %s", exc)
+        logger.warning("Could not disable webhook: %s", exc)
 
 
 # ---------------------------------------------------------------------------
-# Core processing helpers
+# Request helpers
 # ---------------------------------------------------------------------------
+
+async def _check_rate_limit(message: Message) -> bool:
+    allowed, wait_time = rate_limiter.check(message.from_user.id)
+    if not allowed:
+        await message.answer(
+            f"Please slow down a bit. Wait {wait_time}s before sending another request."
+        )
+    return allowed
+
 
 async def process_text_prompt(message: Message, state: FSMContext, prompt: str) -> None:
     await state.set_state(UserState.waiting_text)
@@ -732,20 +701,6 @@ async def process_photo_prompt(
 
 
 # ---------------------------------------------------------------------------
-# Rate limit gate — reuse in every handler
-# ---------------------------------------------------------------------------
-
-async def _check_rate_limit(message: Message) -> bool:
-    """Returns True if the user is allowed to proceed, False if rate-limited."""
-    allowed, wait_time = rate_limiter.check(message.from_user.id)
-    if not allowed:
-        await message.answer(
-            f"Please slow down a bit. Wait {wait_time}s before sending another request."
-        )
-    return allowed
-
-
-# ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
 
@@ -754,8 +709,8 @@ async def start_handler(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
         "Hello! I'm an AI assistant powered by Google Gemini.\n\n"
-        "You can send me text messages or photos and I will do my best to help.\n\n"
-        "Use /new to clear the conversation memory and start fresh.\n"
+        "Send me a text message or a photo and I'll do my best to help.\n\n"
+        "Use /new to clear conversation memory.\n"
         "Use /help to see all available commands.",
         reply_markup=main_menu(),
     )
@@ -771,11 +726,12 @@ async def help_handler(message: Message) -> None:
         "/help — Show this message\n\n"
         "Modes:\n"
         "💬 Text Mode — Ask any text question\n"
-        "🖼 Photo Mode — Send a photo for analysis, then ask follow-up questions about it\n\n"
+        "🖼 Photo Mode — Send a photo for analysis\n\n"
         "Tips:\n"
-        "• You can reply without switching modes — the bot figures out context automatically.\n"
-        "• If your question is very long, break it into smaller parts.\n"
-        "• Some images may not be supported due to content guidelines.",
+        "• The bot remembers your last 12 messages.\n"
+        "• For very long questions, break them into smaller parts.\n"
+        "• Some images may not be supported due to content guidelines.\n"
+        "• If the AI isn't responding, the daily quota may be reached — try again in a few hours.",
         reply_markup=main_menu(),
     )
 
@@ -812,7 +768,7 @@ async def photo_mode_handler(message: Message, state: FSMContext) -> None:
     await state.set_state(UserState.waiting_photo)
     await message.answer(
         "Photo mode enabled.\n"
-        "Send a photo (with an optional caption), or ask a follow-up question about the last photo."
+        "Send a photo (with an optional caption), or ask a follow-up about the last photo."
     )
 
 
@@ -830,26 +786,20 @@ async def photo_message_handler(message: Message, state: FSMContext) -> None:
         image_context_store.remember(message.chat.id, image_bytes, "image/jpeg")
         prompt = (message.caption or "").strip() or "What is in this image? Describe it in detail."
         await process_photo_prompt(
-            message=message,
-            state=state,
-            prompt=prompt,
-            image_bytes=image_bytes,
-            mime_type="image/jpeg",
+            message=message, state=state,
+            prompt=prompt, image_bytes=image_bytes, mime_type="image/jpeg",
         )
     except Exception as exc:
         logger.exception("Error processing photo: %s", exc)
-        await message.answer(
-            "An error occurred while processing the photo. Please try again."
-        )
+        await message.answer("An error occurred while processing the photo. Please try again.")
 
 
 @dp.message(F.text)
 async def text_message_handler(message: Message, state: FSMContext) -> None:
     prompt = (message.text or "").strip()
     if not prompt:
-        await message.answer("Please type a text message or send a photo.")
+        await message.answer("Please type a message or send a photo.")
         return
-
     if not await _check_rate_limit(message):
         return
 
@@ -864,11 +814,10 @@ async def text_message_handler(message: Message, state: FSMContext) -> None:
 
     try:
         if routing.reset_context:
-            logger.info("New topic detected chat_id=%s — clearing old context.", message.chat.id)
+            logger.info("New topic detected chat_id=%s — clearing context.", message.chat.id)
             await conversation_memory.clear_chat(message.chat.id)
             image_context_store.clear(message.chat.id)
             await state.set_state(UserState.waiting_text)
-
         elif (
             current_state == UserState.waiting_photo.state
             and image_context is not None
@@ -876,21 +825,18 @@ async def text_message_handler(message: Message, state: FSMContext) -> None:
         ):
             logger.info("Using last photo as context chat_id=%s.", message.chat.id)
             await process_photo_prompt(
-                message=message,
-                state=state,
-                prompt=prompt,
-                image_bytes=image_context.image_bytes,
-                mime_type=image_context.mime_type,
+                message=message, state=state, prompt=prompt,
+                image_bytes=image_context.image_bytes, mime_type=image_context.mime_type,
             )
             return
 
         await process_text_prompt(message=message, state=state, prompt=prompt)
 
     except Exception as exc:
-        logger.exception("Error processing text request: %s", exc)
+        logger.exception("Error processing text: %s", exc)
         await message.answer(
             "Something went wrong. Please try again.\n"
-            "If the problem continues, use /new to start fresh."
+            "If it keeps failing, use /new to start fresh."
         )
 
 
@@ -898,7 +844,7 @@ async def text_message_handler(message: Message, state: FSMContext) -> None:
 async def fallback_handler(message: Message) -> None:
     await message.answer(
         "I can work with text messages and photos.\n"
-        "Send me a message or an image to get started.",
+        "Send me a message to get started.",
         reply_markup=main_menu(),
     )
 
@@ -929,7 +875,9 @@ def create_web_app() -> web.Application:
     app.router.add_get("/", healthcheck)
     app.router.add_get("/healthz", healthcheck)
     app.router.add_get("/telegram-check", telegram_check)
-    SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=WEBHOOK_SECRET).register(app, path=WEBHOOK_PATH)
+    SimpleRequestHandler(
+        dispatcher=dp, bot=bot, secret_token=WEBHOOK_SECRET
+    ).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
     return app
 
@@ -941,7 +889,6 @@ async def run_webhook() -> None:
     site = web.TCPSite(runner, host=WEB_SERVER_HOST, port=WEB_SERVER_PORT)
     await site.start()
     logger.info("Bot started in webhook mode on %s:%s", WEB_SERVER_HOST, WEB_SERVER_PORT)
-    logger.info("Webhook path: %s", WEBHOOK_PATH)
     await configure_webhook_with_retry()
     await asyncio.Event().wait()
 
